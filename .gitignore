@@ -26,3 +26,7 @@ build/
 
 # os
 .DS_Store
+
+# AI tools
+.codex
+.claude
