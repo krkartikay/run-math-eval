@@ -3,6 +3,7 @@ import os
 
 from openai import OpenAI
 from lm_eval.api.model import LM
+from tqdm import tqdm
 
 
 SYSTEM = """You are being evaluated by an automatic parser.
@@ -52,8 +53,7 @@ class OpenAINanoMathLM(LM):
 
     def generate_until(self, requests):
         outputs = []
-        print(f"Requests: {requests}")
-        for req in requests:
+        for req in tqdm(requests):
             prompt, decoding_config = req.args
             stop = decoding_config.get("until") or None
             max_tokens = decoding_config.get("max_gen_toks", 512)
@@ -69,5 +69,4 @@ class OpenAINanoMathLM(LM):
 
             text = resp.choices[0].message.content or ""
             outputs.append(text)
-        print(f"Outputs: {outputs}")
         return outputs

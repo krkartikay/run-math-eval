@@ -1,0 +1,28 @@
+# env
+.env
+.venv/
+venv/
+env/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# jupyter
+.ipynb_checkpoints/
+
+# mypy / type checkers
+.mypy_cache/
+.ruff_cache/
+
+# ide
+.vscode/
+.idea/
+
+# os
+.DS_Store
