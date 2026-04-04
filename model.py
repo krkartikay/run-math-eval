@@ -1,13 +1,14 @@
+import asyncio
 import logging
 import os
 import re
 
-from openai import OpenAI
+import openai
+from openai import AsyncOpenAI
 from lm_eval.api.model import LM
-from tqdm import tqdm
 
 
-SYSTEM = """You are being evaluated by an automatic parser.
+SYSTEM = """You are a Math problem solver. Your task is to solve math problems.
 
 Solve the problem step by step.
 On a separate final line, write exactly:
@@ -22,6 +23,7 @@ Keep the final answer concise and in canonical mathematical form when possible, 
 
 logger = logging.getLogger(__name__)
 FINAL_ANSWER_RE = re.compile(r"final answer:\s*(.+)", re.IGNORECASE)
+MAX_TOKENS = 4096
 
 
 class OpenAINanoMathLM(LM):
@@ -34,7 +36,7 @@ class OpenAINanoMathLM(LM):
 
     def __init__(self, model: str = "gpt-5.4-nano"):
         super().__init__()
-        self.client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        self.client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self.model = model
 
     @property
@@ -82,21 +84,45 @@ class OpenAINanoMathLM(LM):
         logger.warning("Response had no non-empty lines; no final answer found.")
         return ""
 
+    async def _call_one(self, prompt, max_tokens):
+        for attempt in range(3):
+            try:
+                resp = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_completion_tokens=max_tokens,
+                )
+                if not resp.choices or not resp.choices[0].message.content:
+                    logger.warning("API response had no content: %r", resp)
+                    return ""
+                return resp.choices[0].message.content
+            except openai.BadRequestError as e:
+                logger.error("Bad request (will not retry). prompt: %r error: %s", prompt, e)
+                return ""
+            except openai.AuthenticationError as e:
+                logger.error("Authentication failed, aborting: %s", e)
+                raise
+            except (openai.RateLimitError, openai.APIStatusError, openai.APIConnectionError) as e:
+                if attempt == 2:
+                    logger.error("API call failed after 3 attempts: %s", e)
+                    return ""
+                wait = 2 ** attempt
+                logger.warning("Retrying in %ds (attempt %d/3): %s", wait, attempt + 1, e)
+                await asyncio.sleep(wait)
+
     def generate_until(self, requests):
-        outputs = []
-        for req in tqdm(requests):
-            prompt, decoding_config = req.args
-            max_tokens = decoding_config.get("max_gen_toks", 512)
+        async def run_all():
+            tasks = [
+                self._call_one(
+                    req.args[0],
+                    req.args[1].get("max_gen_toks", MAX_TOKENS),
+                )
+                for req in requests
+            ]
+            return await asyncio.gather(*tasks)
 
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                max_completion_tokens=max_tokens,
-            )
-
-            text = resp.choices[0].message.content or ""
-            outputs.append(self._extract_final_answer(text))
-        return outputs
+        texts = asyncio.run(run_all())
+        return [self._extract_final_answer(t) for t in texts]
