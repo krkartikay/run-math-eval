@@ -11,6 +11,8 @@ from openai import AsyncOpenAI
 from lm_eval.api.model import LM
 
 
+ALLOW_TOOL_CALLS = True
+
 SYSTEM = """You are a Math problem solver. Your task is to solve math problems.
 
 Solve the problem step by step.
@@ -21,16 +23,22 @@ Keep the final answer concise and in canonical mathematical form when possible, 
 2
 \\frac{3}{4}
 \\sqrt{74}
+"""
 
+if ALLOW_TOOL_CALLS:
+    SYSTEM += """
 You may use the `python_code_interpreter` tool for calculations or verification.
 Use it when it helps, then continue reasoning from the tool result.
+"""
+
+SYSTEM += """
 When you are done, respond normally with the required `final answer:` line.
 """
 
 
 logger = logging.getLogger(__name__)
 FINAL_ANSWER_RE = re.compile(r"final answer:\s*(.+)", re.IGNORECASE)
-MAX_TOKENS = 4096
+MAX_TOKENS = 20000
 MAX_TOOL_CALLS = 20
 LOCAL_CODE_TIMEOUT_SECONDS = 2
 CODE_INTERPRETER_TOOL = {
@@ -116,20 +124,24 @@ class OpenAINanoMathLM(LM):
     async def _call_one(self, prompt, max_tokens):
         response_input = prompt
         previous_response_id = None
+        request_kwargs = {
+            "model": self.model,
+            "instructions": SYSTEM,
+            "input": response_input,
+            "max_output_tokens": max_tokens,
+            "reasoning": {"effort": "high"},
+            "previous_response_id": previous_response_id,
+        }
+        if ALLOW_TOOL_CALLS:
+            request_kwargs["tools"] = [CODE_INTERPRETER_TOOL]
+            request_kwargs["tool_choice"] = "auto"
 
         for attempt in range(3):
             for _ in range(MAX_TOOL_CALLS):
                 try:
-                    resp = await self.client.responses.create(
-                        model=self.model,
-                        instructions=SYSTEM,
-                        input=response_input,
-                        tools=[CODE_INTERPRETER_TOOL],
-                        tool_choice="auto",
-                        max_output_tokens=max_tokens,
-                        reasoning={"effort": "high"},
-                        previous_response_id=previous_response_id,
-                    )
+                    request_kwargs["input"] = response_input
+                    request_kwargs["previous_response_id"] = previous_response_id
+                    resp = await self.client.responses.create(**request_kwargs)
                     if not resp.output:
                         logger.warning("API response had no output items: %r", resp)
                         return ""
