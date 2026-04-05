@@ -31,28 +31,27 @@ When you are done, respond normally with the required `final answer:` line.
 logger = logging.getLogger(__name__)
 FINAL_ANSWER_RE = re.compile(r"final answer:\s*(.+)", re.IGNORECASE)
 MAX_TOKENS = 4096
-MAX_TOOL_CALLS = 12
+MAX_TOOL_CALLS = 20
 LOCAL_CODE_TIMEOUT_SECONDS = 2
 CODE_INTERPRETER_TOOL = {
     "type": "function",
-    "function": {
-        "name": "python_code_interpreter",
-        "description": (
-            "Run Python code locally for calculations, symbolic checks, "
-            "or quick experiments."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python code to execute in the sandbox.",
-                }
-            },
-            "required": ["code"],
-            "additionalProperties": False,
+    "name": "python_code_interpreter",
+    "description": (
+        "Run Python code locally for calculations, symbolic checks, "
+        "or quick experiments."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Python code to execute in the sandbox.",
+            }
         },
+        "required": ["code"],
+        "additionalProperties": False,
     },
+    "strict": True,
 }
 
 
@@ -115,59 +114,55 @@ class OpenAINanoMathLM(LM):
         return ""
 
     async def _call_one(self, prompt, max_tokens):
-        messages = [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": prompt},
-        ]
+        response_input = prompt
+        previous_response_id = None
 
         for attempt in range(3):
             for _ in range(MAX_TOOL_CALLS):
                 try:
-                    resp = await self.client.chat.completions.create(
+                    resp = await self.client.responses.create(
                         model=self.model,
-                        messages=messages,
+                        instructions=SYSTEM,
+                        input=response_input,
                         tools=[CODE_INTERPRETER_TOOL],
                         tool_choice="auto",
-                        max_completion_tokens=max_tokens,
+                        max_output_tokens=max_tokens,
+                        reasoning={"effort": "high"},
+                        previous_response_id=previous_response_id,
                     )
-                    if not resp.choices:
-                        logger.warning("API response had no choices: %r", resp)
+                    if not resp.output:
+                        logger.warning("API response had no output items: %r", resp)
                         return ""
 
-                    message = resp.choices[0].message
-                    tool_calls = message.tool_calls or []
-                    assistant_message = {"role": "assistant"}
+                    previous_response_id = resp.id
+                    tool_outputs = []
+                    for output_item in resp.output:
+                        if output_item.type != "function_call":
+                            continue
 
-                    if message.content:
-                        assistant_message["content"] = message.content
-                    if tool_calls:
-                        assistant_message["tool_calls"] = [
-                            tc.model_dump(mode="json") for tc in tool_calls
-                        ]
-                    messages.append(assistant_message)
-
-                    if not tool_calls:
-                        if not message.content:
-                            logger.warning("API response had no content: %r", resp)
-                            return ""
-                        return message.content
-
-                    for tool_call in tool_calls:
-                        tool_name = getattr(tool_call.function, "name", "")
+                        tool_name = output_item.name
                         if tool_name != "python_code_interpreter":
                             tool_output = f"Unsupported tool call: {tool_name}"
                         else:
                             tool_output = await self._run_code_locally(
-                                tool_call.function.arguments,
+                                output_item.arguments,
                             )
 
-                        messages.append(
+                        tool_outputs.append(
                             {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": tool_output,
+                                "type": "function_call_output",
+                                "call_id": output_item.call_id,
+                                "output": tool_output,
                             }
                         )
+
+                    if not tool_outputs:
+                        if not resp.output_text:
+                            logger.warning("API response had no output text: %r", resp)
+                            return ""
+                        return resp.output_text
+
+                    response_input = tool_outputs
                 except openai.BadRequestError as e:
                     logger.error(
                         "Bad request (will not retry). prompt: %r error: %s",
