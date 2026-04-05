@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import json
 import logging
 import os
@@ -220,21 +221,29 @@ class OpenAINanoMathLM(LM):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            communicate_task = asyncio.create_task(process.communicate())
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
+                asyncio.shield(communicate_task),
                 timeout=LOCAL_CODE_TIMEOUT_SECONDS,
             )
             logger.debug(
                 "Code execution completed. stdout: %r stderr: %r", stdout, stderr
             )
         except asyncio.TimeoutError:
-            process.kill()
-            await process.communicate()
+            logger.warning(
+                "Code execution timed out after %ss", LOCAL_CODE_TIMEOUT_SECONDS
+            )
+            if process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.kill()
+            stdout, stderr = b"", b""
+            with suppress(asyncio.CancelledError):
+                stdout, stderr = await communicate_task
             return json.dumps(
                 {
-                    "stdout": "",
-                    "stderr": "",
-                    "returncode": None,
+                    "stdout": stdout.decode("utf-8", errors="replace"),
+                    "stderr": stderr.decode("utf-8", errors="replace"),
+                    "returncode": process.returncode,
                     "timed_out": True,
                 },
                 ensure_ascii=True,
