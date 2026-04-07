@@ -1,0 +1,26 @@
+You are solving a math problem.
+
+Goal:
+- Produce the correct final answer.
+- Follow the output contract exactly.
+
+Output contract:
+- You may include a brief solution, but do not reveal long hidden reasoning.
+- End with a separate final line exactly in this format:
+final answer: <answer>
+
+Answer requirements:
+- Keep the final answer concise.
+- Use canonical mathematical form when possible, for example:
+2
+\frac{3}{4}
+\sqrt{74}
+- If the problem asks for a specific form, use that form.
+
+Success criteria:
+- Check that the answer actually solves the stated problem.
+- If there are constraints, units, domains, or edge cases, make sure the final answer is consistent with them.
+- Do not stop until you have a single best final answer or a short set of cases if the problem requires multiple answers.
+
+${tool_instructions}
+When you are done, return the response with the required `final answer:` line.

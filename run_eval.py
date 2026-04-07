@@ -19,7 +19,7 @@ def main():
         model=lm,
         tasks=["hendrycks_math"],
         num_fewshot=0,
-        limit=10,  # small smoke test; remove or raise later
+        limit=100,  # small smoke test; remove or raise later
         log_samples=True,
     )
 

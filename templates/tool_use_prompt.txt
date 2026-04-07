@@ -1,0 +1,5 @@
+Tool use:
+- You may use the `${tool_name}` tool for calculations, symbolic checks, or quick verification.
+- Use the tool when it materially improves accuracy or speed.
+- Do not use the tool for trivial work you can do reliably without it.
+- After using the tool, interpret the result and continue to the final answer.

@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from functools import wraps
 import json
 import logging
+from pathlib import Path
 import re
+from string import Template
 import sys
 from typing import Awaitable, Callable
 
@@ -13,28 +15,9 @@ from openai import AsyncOpenAI
 
 
 ALLOW_TOOL_CALLS = True
-
-SYSTEM = """You are a Math problem solver. Your task is to solve math problems.
-
-Solve the problem step by step.
-On a separate final line, write exactly:
-final answer: <answer>
-
-Keep the final answer concise and in canonical mathematical form when possible, for example:
-2
-\\frac{3}{4}
-\\sqrt{74}
-"""
-
-if ALLOW_TOOL_CALLS:
-    SYSTEM += """
-You may use the `python_code_interpreter` tool for calculations or verification.
-Use it when it helps, then continue reasoning from the tool result.
-"""
-
-SYSTEM += """
-When you are done, respond normally with the required `final answer:` line.
-"""
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+SYSTEM_PROMPT_TEMPLATE = TEMPLATES_DIR / "system_prompt.txt"
+TOOL_USE_PROMPT_TEMPLATE = TEMPLATES_DIR / "tool_use_prompt.txt"
 
 
 logger = logging.getLogger(__name__)
@@ -184,6 +167,19 @@ class ResponseStateMachine:
         )
 
 
+def render_system_prompt(*, allow_tool_calls: bool) -> str:
+    tool_instructions = ""
+    if allow_tool_calls:
+        tool_instructions = Template(
+            TOOL_USE_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+        ).substitute(
+            tool_name="python_code_interpreter"
+        )
+
+    template = Template(SYSTEM_PROMPT_TEMPLATE.read_text(encoding="utf-8"))
+    return template.substitute(tool_instructions=tool_instructions).strip()
+
+
 def init_state(prompt: str) -> ConversationState:
     return ConversationState(input=prompt)
 
@@ -219,7 +215,7 @@ def extract_final_answer(text: str) -> str:
 def build_request_kwargs(model: str, state: ConversationState) -> dict:
     request_kwargs = {
         "model": model,
-        "instructions": SYSTEM,
+        "instructions": render_system_prompt(allow_tool_calls=ALLOW_TOOL_CALLS),
         "input": state.input,
         "max_output_tokens": MAX_TOKENS,
         "reasoning": {"effort": "high"},
