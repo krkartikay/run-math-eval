@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 import sqlite3
 from collections import Counter
 from http import HTTPStatus
@@ -10,6 +11,7 @@ from urllib.parse import urlparse
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "traces.sqlite3"
+FINAL_ANSWER_RE = re.compile(r"final answer:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
 HTML = """<!doctype html>
@@ -44,7 +46,8 @@ HTML = """<!doctype html>
         radial-gradient(circle at top left, rgba(184, 92, 56, 0.18), transparent 30%),
         radial-gradient(circle at top right, rgba(39, 93, 99, 0.15), transparent 26%),
         linear-gradient(180deg, #f7f1e8 0%, #f2ebe1 45%, #efe7dc 100%);
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
     }
 
     .shell {
@@ -52,7 +55,8 @@ HTML = """<!doctype html>
       grid-template-columns: 360px 1fr;
       gap: 18px;
       padding: 22px;
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
     }
 
     .panel {
@@ -67,6 +71,7 @@ HTML = """<!doctype html>
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      min-height: 0;
     }
 
     .hero, .trace-header {
@@ -140,6 +145,7 @@ HTML = """<!doctype html>
     .trace-list {
       overflow: auto;
       padding: 10px;
+      min-height: 0;
     }
 
     .trace-item {
@@ -193,6 +199,8 @@ HTML = """<!doctype html>
       display: grid;
       grid-template-rows: auto auto 1fr;
       min-width: 0;
+      min-height: 0;
+      overflow: hidden;
     }
 
     .trace-title {
@@ -233,6 +241,7 @@ HTML = """<!doctype html>
       gap: 18px;
       min-height: 0;
       padding: 0 0 22px;
+      overflow: hidden;
     }
 
     .graph-panel, .detail-panel {
@@ -240,6 +249,7 @@ HTML = """<!doctype html>
       overflow: hidden;
       display: flex;
       flex-direction: column;
+      min-height: 0;
     }
 
     .section-head {
@@ -253,11 +263,42 @@ HTML = """<!doctype html>
     .graph-wrap {
       padding: 18px;
       overflow: auto;
-      min-height: 380px;
+      min-height: 0;
+      position: relative;
+      cursor: grab;
       background:
         linear-gradient(rgba(33, 28, 24, 0.04) 1px, transparent 1px),
         linear-gradient(90deg, rgba(33, 28, 24, 0.04) 1px, transparent 1px);
       background-size: 28px 28px;
+    }
+
+    .graph-wrap.dragging {
+      cursor: grabbing;
+    }
+
+    .graph-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .graph-btn {
+      border: 1px solid rgba(33, 28, 24, 0.12);
+      background: rgba(255,255,255,0.85);
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 7px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .graph-btn:hover {
+      border-color: rgba(184, 92, 56, 0.28);
+    }
+
+    .graph-stage {
+      transform-origin: top left;
+      will-change: transform;
     }
 
     svg {
@@ -271,6 +312,7 @@ HTML = """<!doctype html>
       padding: 18px;
       display: grid;
       gap: 16px;
+      min-height: 0;
     }
 
     .detail-card {
@@ -361,6 +403,18 @@ HTML = """<!doctype html>
         min-height: auto;
       }
 
+      .shell {
+        height: auto;
+        min-height: 100vh;
+        overflow: visible;
+      }
+
+      body {
+        height: auto;
+        min-height: 100vh;
+        overflow: auto;
+      }
+
       .summary-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
@@ -403,6 +457,14 @@ HTML = """<!doctype html>
       <div class="toolbar" style="padding-top:0">
         <select id="runFilter"><option value="">All runs</option></select>
       </div>
+      <div class="toolbar" style="padding-top:0">
+        <select id="correctnessFilter">
+          <option value="">All answers</option>
+          <option value="correct">Correct only</option>
+          <option value="wrong">Wrong only</option>
+          <option value="unknown">Unknown only</option>
+        </select>
+      </div>
       <div id="traceList" class="trace-list"></div>
     </aside>
     <main class="main panel">
@@ -420,10 +482,17 @@ HTML = """<!doctype html>
         <section class="panel graph-panel">
           <div class="section-head">
             <h3>Graph</h3>
-            <span class="subtle" id="graphCaption">Node flow</span>
+            <div class="graph-controls">
+              <button class="graph-btn" id="zoomOutBtn" type="button">-</button>
+              <button class="graph-btn" id="resetZoomBtn" type="button">Reset</button>
+              <button class="graph-btn" id="zoomInBtn" type="button">+</button>
+              <span class="subtle" id="graphCaption">Node flow</span>
+            </div>
           </div>
           <div class="graph-wrap">
-            <svg id="graphSvg" viewBox="0 0 1200 720" preserveAspectRatio="xMinYMin meet"></svg>
+            <div class="graph-stage" id="graphStage">
+              <svg id="graphSvg" viewBox="0 0 1200 720" preserveAspectRatio="xMinYMin meet"></svg>
+            </div>
           </div>
         </section>
         <section class="panel detail-panel">
@@ -446,6 +515,7 @@ HTML = """<!doctype html>
       currentTraceId: null,
       currentTrace: null,
       selectedNodeId: null,
+      graphScale: 1,
     };
 
     const el = (id) => document.getElementById(id);
@@ -479,8 +549,10 @@ HTML = """<!doctype html>
     function getFilteredTraces() {
       const query = el('searchBox').value.trim().toLowerCase();
       const runFilter = el('runFilter').value;
+      const correctnessFilter = el('correctnessFilter').value;
       return state.traces.filter((trace) => {
         if (runFilter && trace.eval_run_id !== runFilter) return false;
+        if (correctnessFilter && trace.correctness !== correctnessFilter) return false;
         if (!query) return true;
         const haystack = [
           trace.id,
@@ -488,6 +560,8 @@ HTML = """<!doctype html>
           trace.task_name,
           trace.prompt_preview,
           trace.expected_answer,
+          trace.final_answer,
+          trace.correctness,
         ].filter(Boolean).join(' ').toLowerCase();
         return haystack.includes(query);
       });
@@ -509,6 +583,7 @@ HTML = """<!doctype html>
             <div class="meta-row">
               <span class="pill">${trace.node_count} nodes</span>
               <span class="pill">${trace.edge_count} edges</span>
+              <span class="pill">${escapeHtml(trace.correctness || 'unknown')}</span>
               ${trace.eval_run_id ? `<span class="pill">${escapeHtml(shortId(trace.eval_run_id))}</span>` : ''}
             </div>
           </div>
@@ -522,6 +597,7 @@ HTML = """<!doctype html>
     async function selectTrace(traceId) {
       state.currentTraceId = traceId;
       state.selectedNodeId = null;
+      state.graphScale = 1;
       renderSidebar();
       const response = await fetch(`/api/trace/${encodeURIComponent(traceId)}`);
       state.currentTrace = await response.json();
@@ -539,6 +615,7 @@ HTML = """<!doctype html>
         trace.eval_run_id ? `<span class="pill">${escapeHtml(shortId(trace.eval_run_id))}</span>` : '',
         `<span class="pill">${trace.nodes.length} nodes</span>`,
         `<span class="pill">${trace.edges.length} edges</span>`,
+        `<span class="pill">${escapeHtml(trace.correctness || 'unknown')}</span>`,
         `<span class="pill">${escapeHtml(trace.created_at || '')}</span>`,
       ].join('');
       renderSummaryGrid(trace);
@@ -549,10 +626,12 @@ HTML = """<!doctype html>
     function renderSummaryGrid(trace) {
       const counts = trace.kind_counts || {};
       const cards = [
+        ['Model answer', trace.final_answer || 'N/A'],
+        ['Expected answer', trace.eval_target?.expected_answer || 'N/A'],
+        ['Answer status', trace.correctness || 'unknown'],
         ['Problem nodes', counts.problem || 0],
         ['Response nodes', counts.response || 0],
         ['Tool outputs', counts.tool_output || 0],
-        ['Expected answer', trace.eval_target?.expected_answer || 'N/A'],
       ];
       el('summaryGrid').innerHTML = cards.map(([label, value]) => `
         <div class="summary-card">
@@ -564,9 +643,9 @@ HTML = """<!doctype html>
 
     function renderGraph(trace) {
       const svg = el('graphSvg');
+      const stage = el('graphStage');
       const layerOrder = ['problem', 'response', 'tool_output'];
       const nodes = [...trace.nodes];
-      const indexById = Object.fromEntries(nodes.map((node, index) => [node.id, index]));
       const incoming = Object.fromEntries(nodes.map((node) => [node.id, 0]));
       for (const edge of trace.edges) {
         incoming[edge.target_node_id] = (incoming[edge.target_node_id] || 0) + 1;
@@ -637,9 +716,9 @@ HTML = """<!doctype html>
       const nodesMarkup = nodes.map((node) => {
         const pos = positions[node.id];
         const selected = node.id === state.selectedNodeId ? 'selected' : '';
-        const fill = node.color === 'black' ? '#2a241f' : '#fff8ef';
-        const stroke = node.color === 'black' ? '#2a241f' : '#d9cbbb';
-        const textFill = node.color === 'black' ? '#fff5ea' : '#211c18';
+        const fill = node.color === 'black' ? '#f1e4d3' : '#fff8ef';
+        const stroke = node.color === 'black' ? '#312820' : '#d9cbbb';
+        const textFill = '#211c18';
         const label = truncate(`${node.kind} · ${node.id.slice(-6)}`, 22);
         const preview = truncate(node.preview || '', 44);
         return `
@@ -653,6 +732,7 @@ HTML = """<!doctype html>
       }).join('');
 
       svg.innerHTML = defs + edges + nodesMarkup;
+      applyGraphZoom();
       for (const nodeEl of svg.querySelectorAll('.node')) {
         nodeEl.addEventListener('click', () => {
           state.selectedNodeId = nodeEl.dataset.nodeId;
@@ -666,9 +746,9 @@ HTML = """<!doctype html>
     function renderDetails(trace) {
       const node = trace.nodes.find((entry) => entry.id === state.selectedNodeId) || null;
       const parts = [];
+      if (node) parts.push(renderNodeCard(node));
       parts.push(renderTraceCard(trace));
       if (trace.eval_target) parts.push(renderEvalTargetCard(trace.eval_target));
-      if (node) parts.push(renderNodeCard(node));
       el('detailBody').innerHTML = parts.join('');
       el('detailCaption').textContent = node ? `${node.kind} · ${shortId(node.id)}` : 'Select a node';
     }
@@ -680,6 +760,8 @@ HTML = """<!doctype html>
           <div class="body">
             ${kv('Trace ID', trace.id)}
             ${kv('Eval run', trace.eval_run_id || 'None')}
+            ${kv('Answer status', trace.correctness || 'unknown')}
+            ${kv('Final answer', trace.final_answer || 'None')}
             ${kv('Created', trace.created_at || 'Unknown')}
             ${kv('Metadata', '')}
             <pre>${escapeHtml(formatJson(trace.metadata))}</pre>
@@ -737,6 +819,55 @@ HTML = """<!doctype html>
       return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
     }
 
+    function applyGraphZoom() {
+      const stage = el('graphStage');
+      stage.style.transform = `scale(${state.graphScale})`;
+    }
+
+    function setGraphScale(nextScale) {
+      state.graphScale = Math.max(0.4, Math.min(2.4, Number(nextScale.toFixed(2))));
+      applyGraphZoom();
+    }
+
+    function wireGraphInteractions() {
+      const wrap = document.querySelector('.graph-wrap');
+      let dragging = false;
+      let startX = 0;
+      let startY = 0;
+      let scrollLeft = 0;
+      let scrollTop = 0;
+
+      wrap.addEventListener('wheel', (event) => {
+        if (!event.ctrlKey && !event.metaKey) return;
+        event.preventDefault();
+        setGraphScale(state.graphScale + (event.deltaY < 0 ? 0.1 : -0.1));
+      }, { passive: false });
+
+      wrap.addEventListener('pointerdown', (event) => {
+        dragging = true;
+        wrap.classList.add('dragging');
+        startX = event.clientX;
+        startY = event.clientY;
+        scrollLeft = wrap.scrollLeft;
+        scrollTop = wrap.scrollTop;
+      });
+
+      window.addEventListener('pointerup', () => {
+        dragging = false;
+        wrap.classList.remove('dragging');
+      });
+
+      wrap.addEventListener('pointermove', (event) => {
+        if (!dragging) return;
+        wrap.scrollLeft = scrollLeft - (event.clientX - startX);
+        wrap.scrollTop = scrollTop - (event.clientY - startY);
+      });
+
+      el('zoomInBtn').addEventListener('click', () => setGraphScale(state.graphScale + 0.1));
+      el('zoomOutBtn').addEventListener('click', () => setGraphScale(state.graphScale - 0.1));
+      el('resetZoomBtn').addEventListener('click', () => setGraphScale(1));
+    }
+
     function formatJson(value) {
       return JSON.stringify(value, null, 2);
     }
@@ -752,6 +883,8 @@ HTML = """<!doctype html>
 
     el('searchBox').addEventListener('input', renderSidebar);
     el('runFilter').addEventListener('change', renderSidebar);
+    el('correctnessFilter').addEventListener('change', renderSidebar);
+    wireGraphInteractions();
     loadSummary().catch((error) => {
       el('traceList').innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
     });
@@ -785,6 +918,31 @@ def preview_content(value, limit: int = 120) -> str:
         text = json.dumps(value, ensure_ascii=True)
     compact = " ".join(text.split())
     return compact[: limit - 1] + "…" if len(compact) > limit else compact
+
+
+def extract_final_answer(value) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    matches = FINAL_ANSWER_RE.findall(value)
+    if not matches:
+        return None
+    answer = matches[-1].strip()
+    return answer or None
+
+
+def normalize_answer(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(value.strip().split())
+    return normalized or None
+
+
+def classify_correctness(final_answer: str | None, expected_answer: str | None) -> str:
+    norm_final = normalize_answer(final_answer)
+    norm_expected = normalize_answer(expected_answer)
+    if norm_final is None or norm_expected is None:
+        return "unknown"
+    return "correct" if norm_final == norm_expected else "wrong"
 
 
 def fetch_summary(db_path: Path) -> dict:
@@ -834,13 +992,32 @@ def fetch_summary(db_path: Path) -> dict:
 
     traces = []
     for row in trace_rows:
+        trace_id = row["id"]
+        final_answer = None
+        if trace_id:
+            with connect(db_path) as conn:
+                response_row = conn.execute(
+                    """
+                    SELECT content_json
+                    FROM nodes
+                    WHERE trace_id = ? AND kind = 'response'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (trace_id,),
+                ).fetchone()
+            if response_row is not None:
+                final_answer = extract_final_answer(parse_json(response_row["content_json"]))
+        correctness = classify_correctness(final_answer, row["expected_answer"])
         traces.append(
             {
-                "id": row["id"],
+                "id": trace_id,
                 "eval_run_id": row["eval_run_id"],
                 "created_at": row["created_at"],
                 "task_name": row["task_name"],
                 "expected_answer": row["expected_answer"],
+                "final_answer": final_answer,
+                "correctness": correctness,
                 "prompt_preview": preview_content(row["prompt_text"], limit=170),
                 "node_count": row["node_count"],
                 "edge_count": row["edge_count"],
@@ -934,12 +1111,26 @@ def fetch_trace(db_path: Path, trace_id: str) -> dict | None:
             "created_at": eval_target_row["created_at"],
         }
 
+    final_answer = None
+    for node in reversed(nodes):
+        if node["kind"] != "response":
+            continue
+        final_answer = extract_final_answer(node["content"])
+        if final_answer:
+            break
+    correctness = classify_correctness(
+        final_answer,
+        eval_target["expected_answer"] if eval_target is not None else None,
+    )
+
     return {
         "id": trace_row["id"],
         "eval_run_id": trace_row["eval_run_id"],
         "created_at": trace_row["created_at"],
         "metadata": parse_json(trace_row["metadata_json"]),
         "kind_counts": dict(kind_counts),
+        "final_answer": final_answer,
+        "correctness": correctness,
         "nodes": nodes,
         "edges": edges,
         "eval_target": eval_target,
