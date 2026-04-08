@@ -30,3 +30,6 @@ build/
 # AI tools
 .codex
 .claude
+
+# Data
+*.sqlite3
