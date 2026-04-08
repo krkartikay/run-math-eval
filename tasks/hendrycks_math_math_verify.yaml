@@ -1,0 +1,27 @@
+group: hendrycks_math_math_verify
+task:
+  - task: hendrycks_math_algebra
+    filter_list: &math_verify_filter_list
+      - name: math_verify
+        filter:
+          - function: custom
+            filter_fn: !function utils.math_verify_filter
+          - function: take_first
+  - task: hendrycks_math_counting_and_prob
+    filter_list: *math_verify_filter_list
+  - task: hendrycks_math_geometry
+    filter_list: *math_verify_filter_list
+  - task: hendrycks_math_intermediate_algebra
+    filter_list: *math_verify_filter_list
+  - task: hendrycks_math_num_theory
+    filter_list: *math_verify_filter_list
+  - task: hendrycks_math_prealgebra
+    filter_list: *math_verify_filter_list
+  - task: hendrycks_math_precalc
+    filter_list: *math_verify_filter_list
+aggregate_metric_list:
+  - metric: exact_match
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0
