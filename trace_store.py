@@ -217,22 +217,6 @@ class TraceStore:
                 ),
             )
 
-    def find_node_id_by_call_id(self, call_id: str) -> str | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id
-                FROM nodes
-                WHERE trace_id = ?
-                  AND kind = 'tool_output'
-                  AND json_extract(metadata_json, '$.call_id') = ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (self.trace_id, call_id),
-            ).fetchone()
-        return None if row is None else str(row["id"])
-
     def add_eval_target(
         self,
         *,

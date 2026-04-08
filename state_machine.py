@@ -9,12 +9,11 @@ import re
 from string import Template
 import sys
 from typing import Any, Awaitable, Callable
-from uuid import uuid4
 
 import openai
 from openai import AsyncOpenAI
 
-from trace_store import TraceStore
+from tracing import TraceRecorder
 
 
 ALLOW_TOOL_CALLS = True
@@ -56,10 +55,6 @@ CODE_INTERPRETER_TOOL = {
 class ConversationState:
     input: str | list[dict]
     prev_response_id: str | None = None
-    trace: "TraceStore | None" = None
-    trace_id: str | None = None
-    latest_white_node_ids: tuple[str, ...] = ()
-    pending_tool_parents: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -79,6 +74,12 @@ class Calls:
 
 
 @dataclass(frozen=True)
+class ToolExecutionResult:
+    request: ToolRequest
+    tool_output: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class EvalTarget:
     task_name: str | None
     doc_id: int | None
@@ -90,6 +91,10 @@ class EvalTarget:
 
 StepResult = Final | Calls
 StepFn = Callable[[ConversationState], Awaitable[tuple[StepResult, ConversationState]]]
+ToolRunnerFn = Callable[
+    [ConversationState, ToolRequest], Awaitable[ToolExecutionResult]
+]
+RawResponseStepFn = Callable[[ConversationState], Awaitable[Any | None]]
 
 
 class ResponseStateMachine:
@@ -105,57 +110,66 @@ class ResponseStateMachine:
         self.eval_run_id = eval_run_id
 
     async def solve(self, prompt: str, eval_target: EvalTarget | None = None) -> str:
+        tracer = TraceRecorder.create(
+            prompt=prompt,
+            eval_run_id=self.eval_run_id,
+            eval_target=eval_target,
+        )
         return await self._unfold(
-            self._build_step(),
-            init_state(prompt, eval_run_id=self.eval_run_id, eval_target=eval_target),
+            self._build_step(tracer),
+            self._build_tool_runner(tracer),
+            init_state(prompt),
         )
 
-    def _build_step(self) -> StepFn:
-        @with_trace
+    def _build_step(self, tracer: TraceRecorder) -> StepFn:
+        @with_trace(tracer=tracer, kind="response")
         @with_retry
         @with_timeout
         async def base_step(state: ConversationState):
-            resp = await self.client.responses.create(
+            return await self.client.responses.create(
                 **build_request_kwargs(self.model, state)
             )
-            trace_info = record_response_node(state, resp)
-            next_state = ConversationState(
-                input=state.input,
-                prev_response_id=resp.id,
-                trace=state.trace,
-                trace_id=state.trace_id,
-                latest_white_node_ids=state.latest_white_node_ids,
-                pending_tool_parents=trace_info.get("tool_parent_map", {}),
-            )
-            return classify_response(resp), next_state
 
         return base_step
 
-    async def _unfold(self, step_fn: StepFn, state: ConversationState) -> str:
+    def _build_tool_runner(self, tracer: TraceRecorder) -> ToolRunnerFn:
+        @with_trace(tracer=tracer, kind="tool")
+        async def run_tool(state: ConversationState, request: ToolRequest):
+            return await self._run_tool_request(state, request)
+
+        return run_tool
+
+    async def _unfold(
+        self,
+        step_fn: StepFn,
+        tool_runner: ToolRunnerFn,
+        state: ConversationState,
+    ) -> str:
         for _ in range(MAX_TOOL_CALLS):
             result, next_state = await step_fn(state)
             match result:
                 case Final(text):
                     return text
                 case Calls(requests):
-                    tool_outputs = await asyncio.gather(
-                        *(self._run_tool_request(next_state, request) for request in requests)
+                    tool_results = await asyncio.gather(
+                        *(tool_runner(next_state, request) for request in requests)
                     )
-                    state = advance_state(next_state, tool_outputs)
+                    state = advance_state(next_state, tool_results)
 
         logger.warning("Exceeded maximum tool-call loop count for state: %r", state)
         return ""
 
     async def _run_tool_request(
         self, state: ConversationState, request: ToolRequest
-    ) -> dict:
+    ) -> ToolExecutionResult:
         if not request.code.strip():
             output = "Tool argument error: `code` must be a non-empty string."
         else:
             output = await self._run_code_locally(request.code)
-        tool_output = tool_output_input(request.call_id, output)
-        record_tool_output_node(state, request, tool_output)
-        return tool_output
+        return ToolExecutionResult(
+            request=request,
+            tool_output=tool_output_input(request.call_id, output),
+        )
 
     async def _run_code_locally(self, code: str) -> str:
         try:
@@ -206,9 +220,7 @@ def render_system_prompt(*, allow_tool_calls: bool) -> str:
     if allow_tool_calls:
         tool_instructions = Template(
             TOOL_USE_PROMPT_TEMPLATE.read_text(encoding="utf-8")
-        ).substitute(
-            tool_name="python_code_interpreter"
-        )
+        ).substitute(tool_name="python_code_interpreter")
 
     template = Template(SYSTEM_PROMPT_TEMPLATE.read_text(encoding="utf-8"))
     return template.substitute(tool_instructions=tool_instructions).strip()
@@ -216,34 +228,8 @@ def render_system_prompt(*, allow_tool_calls: bool) -> str:
 
 def init_state(
     prompt: str,
-    *,
-    eval_run_id: str | None = None,
-    eval_target: EvalTarget | None = None,
 ) -> ConversationState:
-    trace = TraceStore(eval_run_id=eval_run_id)
-    root_node_id = f"node_{uuid4().hex}"
-    trace.add_node(
-        node_id=root_node_id,
-        kind="problem",
-        color="white",
-        content=prompt,
-        metadata={},
-    )
-    if eval_target is not None:
-        trace.add_eval_target(
-            task_name=eval_target.task_name,
-            doc_id=eval_target.doc_id,
-            prompt_text=eval_target.prompt_text,
-            expected_answer=eval_target.expected_answer,
-            doc=eval_target.doc,
-            metadata=eval_target.metadata,
-        )
-    return ConversationState(
-        input=prompt,
-        trace=trace,
-        trace_id=trace.trace_id,
-        latest_white_node_ids=(root_node_id,),
-    )
+    return ConversationState(input=prompt)
 
 
 def extract_final_answer(text: str) -> str:
@@ -329,83 +315,6 @@ def classify_response(resp) -> StepResult:
     return Final(resp.output_text)
 
 
-def serialize_response(resp) -> dict:
-    return {
-        "id": resp.id,
-        "output_text": resp.output_text,
-        "output": [
-            {
-                "id": getattr(item, "id", None),
-                "type": getattr(item, "type", None),
-                "name": getattr(item, "name", None),
-                "call_id": getattr(item, "call_id", None),
-                "arguments": getattr(item, "arguments", None),
-            }
-            for item in (resp.output or [])
-        ],
-    }
-
-
-def record_response_node(state: ConversationState, resp) -> dict[str, object]:
-    if state.trace is None:
-        return {}
-
-    response_node_id = f"node_{uuid4().hex}"
-    state.trace.add_node(
-        node_id=response_node_id,
-        kind="response",
-        color="black",
-        content=resp.output_text,
-        metadata=serialize_response(resp),
-    )
-    for white_node_id in state.latest_white_node_ids:
-        state.trace.add_edge(
-            source=white_node_id,
-            target=response_node_id,
-            relation="prompted_response",
-            metadata={"response_id": resp.id},
-        )
-
-    tool_parent_map = {}
-    for output_item in resp.output or []:
-        if getattr(output_item, "type", None) == "function_call":
-            tool_parent_map[output_item.call_id] = response_node_id
-
-    return {
-        "response_node_id": response_node_id,
-        "tool_parent_map": tool_parent_map,
-    }
-
-
-def record_tool_output_node(
-    state: ConversationState, request: ToolRequest, tool_output: dict
-) -> str | None:
-    if state.trace is None:
-        return None
-
-    tool_node_id = f"node_{uuid4().hex}"
-    state.trace.add_node(
-        node_id=tool_node_id,
-        kind="tool_output",
-        color="white",
-        content=tool_output,
-        metadata={
-            "call_id": request.call_id,
-            "tool_name": "python_code_interpreter",
-            "code": request.code,
-        },
-    )
-    parent_node_id = state.pending_tool_parents.get(request.call_id)
-    if parent_node_id:
-        state.trace.add_edge(
-            source=parent_node_id,
-            target=tool_node_id,
-            relation="tool_result",
-            metadata={"call_id": request.call_id},
-        )
-    return tool_node_id
-
-
 def tool_output_input(call_id: str, output: str) -> dict:
     return {
         "type": "function_call_output",
@@ -415,22 +324,11 @@ def tool_output_input(call_id: str, output: str) -> dict:
 
 
 def advance_state(
-    state: ConversationState, tool_outputs: list[dict]
+    state: ConversationState, tool_results: list[ToolExecutionResult]
 ) -> ConversationState:
-    latest_white_node_ids: list[str] = []
-    if state.trace is not None and tool_outputs:
-        for tool_output in tool_outputs:
-            call_id = tool_output.get("call_id")
-            node_id = state.trace.find_node_id_by_call_id(call_id)
-            if node_id is not None:
-                latest_white_node_ids.append(node_id)
-
     return ConversationState(
-        input=tool_outputs,
+        input=[result.tool_output for result in tool_results],
         prev_response_id=state.prev_response_id,
-        trace=state.trace,
-        trace_id=state.trace_id,
-        latest_white_node_ids=tuple(latest_white_node_ids),
     )
 
 
@@ -445,7 +343,7 @@ def build_code_result(
     }
 
 
-def with_timeout(step_fn: StepFn) -> StepFn:
+def with_timeout(step_fn: RawResponseStepFn) -> RawResponseStepFn:
     @wraps(step_fn)
     async def wrapper(state: ConversationState):
         return await asyncio.wait_for(step_fn(state), timeout=API_TIMEOUT_SECONDS)
@@ -453,7 +351,7 @@ def with_timeout(step_fn: StepFn) -> StepFn:
     return wrapper
 
 
-def with_retry(step_fn: StepFn) -> StepFn:
+def with_retry(step_fn: RawResponseStepFn) -> RawResponseStepFn:
     @wraps(step_fn)
     async def wrapper(state: ConversationState):
         for attempt in range(API_MAX_ATTEMPTS):
@@ -465,7 +363,7 @@ def with_retry(step_fn: StepFn) -> StepFn:
                     state,
                     e,
                 )
-                return Final(""), state
+                return None
             except openai.AuthenticationError as e:
                 logger.error("Authentication failed, aborting: %s", e)
                 raise
@@ -481,7 +379,7 @@ def with_retry(step_fn: StepFn) -> StepFn:
                         API_MAX_ATTEMPTS,
                         e,
                     )
-                    return Final(""), state
+                    return None
                 wait = 2**attempt
                 logger.warning(
                     "Retrying in %ds (attempt %d/%d): %s",
@@ -495,11 +393,52 @@ def with_retry(step_fn: StepFn) -> StepFn:
     return wrapper
 
 
-def with_trace(step_fn: StepFn) -> StepFn:
-    @wraps(step_fn)
-    async def wrapper(state: ConversationState):
-        result, new_state = await step_fn(state)
-        logger.debug("Step state=%r result=%r next_state=%r", state, result, new_state)
-        return result, new_state
+def apply_response(
+    state: ConversationState, resp
+) -> tuple[StepResult, ConversationState]:
+    return classify_response(resp), ConversationState(
+        input=state.input,
+        prev_response_id=resp.id,
+    )
 
-    return wrapper
+
+def with_trace(
+    *, tracer: TraceRecorder, kind: str
+) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]:
+    def decorator(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            if kind == "response":
+                state = args[0]
+                resp = await fn(*args, **kwargs)
+                if resp is None:
+                    result, new_state = Final(""), state
+                    logger.debug(
+                        "Step state=%r result=%r next_state=%r",
+                        state,
+                        result,
+                        new_state,
+                    )
+                    return result, new_state
+                tracer.record_response(resp)
+                result, new_state = apply_response(state, resp)
+                logger.debug(
+                    "Step state=%r result=%r next_state=%r", state, result, new_state
+                )
+                return result, new_state
+
+            state, request = args[:2]
+            tool_result = await fn(*args, **kwargs)
+            tracer.record_tool_result(
+                call_id=request.call_id,
+                code=request.code,
+                tool_output=tool_result.tool_output,
+            )
+            logger.debug(
+                "Tool state=%r request=%r result=%r", state, request, tool_result
+            )
+            return tool_result
+
+        return wrapper
+
+    return decorator
